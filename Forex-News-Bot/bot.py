@@ -17,7 +17,7 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+DEFAULT_CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 RUN_MODE = os.getenv("RUN_MODE", "continuous").strip().lower()
 CURRENCIES_RAW = os.getenv("TARGET_CURRENCIES", "USD,EUR,GBP,JPY,AUD,CAD,CHF,NZD")
 TARGET_CURRENCIES = [c.strip().upper() for c in CURRENCIES_RAW.split(",") if c.strip()]
@@ -67,6 +67,12 @@ async def start_health_check_server():
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
+            CREATE TABLE IF NOT EXISTS bot_config (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS sent_alerts (
                 event_id TEXT,
                 alert_type TEXT,
@@ -80,11 +86,25 @@ async def init_db():
                 seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS sent_events (
-                event_id TEXT PRIMARY KEY
-            )
-        """)
+        await db.commit()
+
+async def get_alert_channel_id() -> int:
+    async with aiosqlite.connect(DB_FILE) as db:
+        async with db.execute("SELECT value FROM bot_config WHERE key = 'alert_channel_id'") as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                try:
+                    return int(row[0])
+                except ValueError:
+                    pass
+    return DEFAULT_CHANNEL_ID
+
+async def set_alert_channel_id(channel_id: int):
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute(
+            "INSERT INTO bot_config (key, value) VALUES ('alert_channel_id', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(channel_id),)
+        )
         await db.commit()
 
 async def is_alert_sent(event_id: str, alert_type: str) -> bool:
@@ -121,7 +141,7 @@ async def is_news_seen(news_id: str) -> bool:
 
 async def mark_news_seen(news_id: str):
     async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("INSERT OR IGNORE INTO seen_news (news_id) VALUES (?)", (news_id,))
+        await db.execute("INSERT OR IGNORE INTO seen_news (news_id) VALUES (?, ?)", (news_id,))
         await db.commit()
 
 async def get_db_stats():
@@ -161,7 +181,7 @@ def get_smc_volatility(event_title: str) -> str:
 
 async def analyze_sentiment(headline: str) -> str:
     lower_head = headline.lower()
-    bearish_words = ["cut", "dovish", "stimulus", "contraction", "drop", "falls", "slump", "easing", "misses", "slowdown", "bearish", "plunges"]
+    bearish_words = ["cut", "dovish", "stimulus", "contraction", "drop", "falls", "slump", "easing", "misses", "slowdown", "bearish", "plunges", "crash"]
     bullish_words = ["hike", "hawkish", "growth", "expansion", "surge", "beats", "rises", "tightening", "strong", "higher", "bullish", "jump"]
     
     bear_score = sum(1 for word in bearish_words if word in lower_head)
@@ -285,8 +305,8 @@ async def process_breaking_news(channel: discord.TextChannel):
 
     shock_keywords = [
         "emergency", "rate cut", "rate hike", "intervention", "unplanned",
-        "flash crash", "war", "sanction", "inflation surge", "bank failure",
-        "geopolitical", "central bank", "crisis", "default", "liquidity"
+        "flash crash", "crash", "war", "sanction", "inflation surge", "bank failure",
+        "geopolitical", "central bank", "crisis", "default", "liquidity", "plunge", "collapse"
     ]
 
     for entry in entries:
@@ -303,24 +323,27 @@ async def process_breaking_news(channel: discord.TextChannel):
             clean_summary = clean_html_text(summary_raw)[:250]
             
             embed = discord.Embed(
-                title="🚨 FLASH MARKET EVENT",
+                title="🚨 FLASH MARKET / CRASH ALERT",
                 description=f"### [{title}]({entry.link})\n\n{clean_summary}...",
-                color=0x9B59B6
+                color=0xE74C3C
             )
             embed.add_field(name="Market Sentiment", value=sentiment, inline=False)
-            embed.set_footer(text="Breaking Forex News Alert")
+            embed.set_footer(text="Breaking Forex Alert • Auto-detected")
 
             try:
                 await channel.send(embed=embed, view=AlertView("USD"))
                 await mark_news_seen(news_id)
-                logger.info(f"Sent breaking news alert: {title}")
+                logger.info(f"Sent breaking news/crash alert: {title}")
             except Exception as e:
                 logger.error(f"Failed to send breaking news alert: {e}")
 
 # --- RECURRING MONITOR TASK (Continuous Mode) ---
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_task():
-    channel = bot.get_channel(CHANNEL_ID)
+    channel_id = await get_alert_channel_id()
+    if not channel_id:
+        return
+    channel = bot.get_channel(channel_id)
     if not channel:
         return
     await process_calendar_alerts(channel)
@@ -343,9 +366,10 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Failed to sync slash commands: {e}")
 
-    channel = bot.get_channel(CHANNEL_ID)
+    channel_id = await get_alert_channel_id()
+    channel = bot.get_channel(channel_id) if channel_id else None
     if not channel:
-        logger.warning(f"Target Channel with ID '{CHANNEL_ID}' not found or bot lacks permission.")
+        logger.warning(f"Target Alert Channel with ID '{channel_id}' not found. Use /setloc in Discord to configure.")
 
     # Start healthcheck server for Render
     try:
@@ -365,7 +389,27 @@ async def on_ready():
             monitor_task.start()
         logger.info(f"24/7 Continuous background monitoring started (interval: {CHECK_INTERVAL_SECONDS}s).")
 
-# --- INTERACTIVE SLASH COMMANDS ---
+# --- ADMIN COMMAND: /setloc ---
+@bot.tree.command(name="setloc", description="[Admin Only] Set the channel where bot will send automated news & crash alerts")
+@app_commands.describe(channel="Select the channel to receive alerts (leave blank to select current channel)")
+@app_commands.default_permissions(administrator=True)
+async def slash_setloc(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ **Permission Denied:** Sirf Server Administrators yeh command use kar sakte hain.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    await set_alert_channel_id(target_channel.id)
+
+    embed = discord.Embed(
+        title="📍 Alert Location Set Successfully!",
+        description=f"Ab saare **Automated News Warnings & Crash/Shock Alerts** automatically {target_channel.mention} me aayenge.\n\n*Members kisi bhi channel me commands (`/today`, `/news`, etc.) use kar sakte hain.*",
+        color=0x2ECC71
+    )
+    embed.set_footer(text="Forex News Bot • Alert Routing Updated")
+    await interaction.response.send_message(embed=embed)
+
+# --- MEMBER SLASH COMMANDS (Usable in any channel) ---
 @bot.tree.command(name="today", description="View all High-Impact Forex events scheduled for today")
 async def slash_today(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -476,10 +520,12 @@ async def slash_news(interaction: discord.Interaction):
     embed.set_footer(text="Forex News Bot • Breaking Market Intelligence")
     await interaction.followup.send(embed=embed)
 
-@bot.tree.command(name="status", description="Check Forex News Bot status, DB stats, and monitored currencies")
+@bot.tree.command(name="status", description="Check Forex News Bot status, configured alert channel, and diagnostics")
 async def slash_status(interaction: discord.Interaction):
     alerts_count, news_count = await get_db_stats()
     latency_ms = round(bot.latency * 1000, 1)
+    channel_id = await get_alert_channel_id()
+    channel_display = f"<#{channel_id}>" if channel_id else "`Not Set`"
 
     embed = discord.Embed(
         title="🤖 Forex News Bot Status & Diagnostics",
@@ -487,10 +533,10 @@ async def slash_status(interaction: discord.Interaction):
     )
     embed.add_field(name="Bot Latency", value=f"`{latency_ms} ms`", inline=True)
     embed.add_field(name="Running Mode", value=f"`{RUN_MODE.upper()}`", inline=True)
-    embed.add_field(name="Check Interval", value=f"`{CHECK_INTERVAL_SECONDS}s`", inline=True)
+    embed.add_field(name="Alert Channel (Auto-Posts)", value=channel_display, inline=True)
     embed.add_field(name="Monitored Currencies", value=f"`{', '.join(TARGET_CURRENCIES)}`", inline=False)
     embed.add_field(name="Database Records", value=f"• Sent Alerts: `{alerts_count}`\n• Seen News: `{news_count}`", inline=False)
-    embed.set_footer(text="Forex News Bot System Health")
+    embed.set_footer(text="Forex News Bot System Health • Use /setloc to change alert channel")
     await interaction.response.send_message(embed=embed)
 
 # --- STARTUP ENTRY POINT ---
