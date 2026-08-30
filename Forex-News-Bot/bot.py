@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import aiohttp
+from aiohttp import web
 import aiosqlite
 import discord
 from discord import app_commands
@@ -21,6 +22,7 @@ RUN_MODE = os.getenv("RUN_MODE", "continuous").strip().lower()
 CURRENCIES_RAW = os.getenv("TARGET_CURRENCIES", "USD,EUR,GBP,JPY,AUD,CAD,CHF,NZD")
 TARGET_CURRENCIES = [c.strip().upper() for c in CURRENCIES_RAW.split(",") if c.strip()]
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+PORT = int(os.getenv("PORT", "10000"))
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 RSS_URLS = [
@@ -31,6 +33,10 @@ DB_FILE = "trading_bot.db"
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 }
+
+# Cache for economic calendar to avoid rate limits
+cached_calendar_events = []
+last_calendar_fetch = datetime.min.replace(tzinfo=timezone.utc)
 
 # Setup logging
 logging.basicConfig(
@@ -43,10 +49,23 @@ logger = logging.getLogger("ForexNewsBot")
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# --- DUMMY HTTP HEALTHCHECK SERVER FOR RENDER ---
+async def start_health_check_server():
+    """Keeps Render Free Web Service happy by binding to the assigned PORT."""
+    app = web.Application()
+    async def handle_health(request):
+        return web.Response(text="Forex News Bot is Running 24/7!", content_type="text/plain")
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Health check HTTP server bound to port {PORT}")
+
 # --- DATABASE LAYER ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
-        # Multi-stage alerts table (supports 24h, 1h, 15m)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sent_alerts (
                 event_id TEXT,
@@ -55,14 +74,12 @@ async def init_db():
                 PRIMARY KEY (event_id, alert_type)
             )
         """)
-        # Seen breaking news RSS table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS seen_news (
                 news_id TEXT PRIMARY KEY,
                 seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Backward compatibility check for old sent_events table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS sent_events (
                 event_id TEXT PRIMARY KEY
@@ -72,14 +89,12 @@ async def init_db():
 
 async def is_alert_sent(event_id: str, alert_type: str) -> bool:
     async with aiosqlite.connect(DB_FILE) as db:
-        # Check new multi-stage table
         async with db.execute(
             "SELECT 1 FROM sent_alerts WHERE event_id = ? AND alert_type = ?", 
             (event_id, alert_type)
         ) as cursor:
             if await cursor.fetchone() is not None:
                 return True
-        # Check old table if 24h
         if alert_type == "24h":
             async with db.execute(
                 "SELECT 1 FROM sent_events WHERE event_id = ?", 
@@ -134,7 +149,6 @@ def clean_html_text(raw_html: str) -> str:
     return clean.strip()
 
 def check_session_overlap(event_time_utc: datetime) -> bool:
-    """London (08:00-16:00 UTC) and NY (13:00-21:00 UTC) overlap is 13:00 to 16:00 UTC."""
     overlap_start = time(13, 0)
     overlap_end = time(16, 0)
     return overlap_start <= event_time_utc.time() <= overlap_end
@@ -142,7 +156,7 @@ def check_session_overlap(event_time_utc: datetime) -> bool:
 def get_smc_volatility(event_title: str) -> str:
     high_impact_keywords = ["CPI", "NFP", "Non-Farm", "FOMC", "Fed Interest Rate", "ECB Rate", "BOE Rate", "GDP", "Inflation", "Retail Sales", "Unemployment"]
     if any(keyword.lower() in event_title.lower() for keyword in high_impact_keywords):
-        return "🔥 High (50-100+ Pips | Liquidity Sweeps & High Slippage Expected)"
+        return "🔥 High (50-100+ Pips | Liquidity Sweeps Expected)"
     return "⚡ Moderate (20-50 Pips | Normal Expansion)"
 
 async def analyze_sentiment(headline: str) -> str:
@@ -154,22 +168,37 @@ async def analyze_sentiment(headline: str) -> str:
     bull_score = sum(1 for word in bullish_words if word in lower_head)
     
     if bear_score > bull_score:
-        return "📉 **Bearish Bias Expected** (Institutional Selling Pressure)"
+        return "📉 **Bearish Bias Expected**"
     elif bull_score > bear_score:
-        return "📈 **Bullish Bias Expected** (Institutional Buying Pressure)"
-    return "⚖️ **Neutral / High Volatility** (Two-way liquidity hunt possible)"
+        return "📈 **Bullish Bias Expected**"
+    return "⚖️ **Neutral / High Volatility**"
 
-# --- DATA FETCHING ---
+# --- DATA FETCHING WITH CACHING ---
 async def fetch_calendar_events():
+    global cached_calendar_events, last_calendar_fetch
+    now = datetime.now(timezone.utc)
+    
+    if cached_calendar_events and (now - last_calendar_fetch).total_seconds() < 300:
+        return cached_calendar_events
+
     try:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(headers=HTTP_HEADERS, timeout=timeout) as session:
             async with session.get(CALENDAR_URL) as response:
                 if response.status == 200:
-                    return await response.json()
-                logger.warning(f"Failed to fetch calendar, status code: {response.status}")
+                    data = await response.json()
+                    cached_calendar_events = data
+                    last_calendar_fetch = now
+                    return data
+                elif response.status == 429:
+                    if cached_calendar_events:
+                        return cached_calendar_events
+                else:
+                    logger.warning(f"Failed to fetch calendar, status code: {response.status}")
     except Exception as e:
         logger.error(f"Error fetching calendar: {e}")
+        if cached_calendar_events:
+            return cached_calendar_events
     return []
 
 async def fetch_breaking_news_entries():
@@ -216,10 +245,6 @@ async def process_calendar_alerts(channel: discord.TextChannel):
         total_seconds = time_diff.total_seconds()
         event_id = f"alert_{country}_{title}_{raw_date}"
 
-        # Define Alert Stages:
-        # 1. 24-Hour Warning: 23h 50m to 24h 10m
-        # 2. 1-Hour Reminder: 50m to 65m
-        # 3. 15-Minute Imminent Alert: 5m to 18m
         stages = [
             ("24h", timedelta(hours=23, minutes=50).total_seconds(), timedelta(hours=24, minutes=10).total_seconds(), 0x3498DB, "🗓️ 24-HOUR ADVANCE WARNING"),
             ("1h", timedelta(minutes=50).total_seconds(), timedelta(minutes=65).total_seconds(), 0xE67E22, "⏰ 1-HOUR EVENT REMINDER"),
@@ -231,27 +256,27 @@ async def process_calendar_alerts(channel: discord.TextChannel):
                 if await is_alert_sent(event_id, alert_type):
                     continue
 
-                session_overlap = "🔥 **London / NY Overlap (Peak Volume & Slippage Risk)**" if check_session_overlap(event_time) else "Standard Session"
+                session_overlap = "🔥 **London / NY Overlap (High Volatility)**" if check_session_overlap(event_time) else "Standard Session"
                 volatility = get_smc_volatility(title)
                 unix_ts = int(event_time.timestamp())
 
                 embed = discord.Embed(
                     title=f"{stage_title}: {title}",
-                    description=f"**Currency:** `{country}`\n**Scheduled Time:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)\n**Session Condition:** {session_overlap}",
+                    description=f"**Currency:** `{country}`\n**Time:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)\n**Session:** {session_overlap}",
                     color=color
                 )
-                embed.add_field(name="🎯 Volatility Expectation", value=volatility, inline=False)
+                embed.add_field(name="Expected Move", value=volatility, inline=False)
                 embed.add_field(name="Forecast", value=event.get("forecast") or "N/A", inline=True)
                 embed.add_field(name="Previous", value=event.get("previous") or "N/A", inline=True)
                 embed.add_field(name="Impact", value="🔴 High Impact", inline=True)
-                embed.set_footer(text="Forex News Bot • Powered by ForexFactory Data")
+                embed.set_footer(text="Forex News Bot • ForexFactory Data")
 
                 try:
                     await channel.send(embed=embed, view=AlertView(country))
                     await mark_alert_sent(event_id, alert_type)
                     logger.info(f"Sent {alert_type} alert for {country} - {title}")
                 except Exception as e:
-                    logger.error(f"Failed to send calendar alert to channel: {e}")
+                    logger.error(f"Failed to send calendar alert: {e}")
 
 async def process_breaking_news(channel: discord.TextChannel):
     entries = await fetch_breaking_news_entries()
@@ -278,12 +303,12 @@ async def process_breaking_news(channel: discord.TextChannel):
             clean_summary = clean_html_text(summary_raw)[:250]
             
             embed = discord.Embed(
-                title="🚨 FLASH BREAKING MARKET EVENT",
+                title="🚨 FLASH MARKET EVENT",
                 description=f"### [{title}]({entry.link})\n\n{clean_summary}...",
                 color=0x9B59B6
             )
-            embed.add_field(name="🤖 Market Sentiment Bias", value=sentiment, inline=False)
-            embed.set_footer(text="Breaking Forex News Alert • Real-time Feeds")
+            embed.add_field(name="Market Sentiment", value=sentiment, inline=False)
+            embed.set_footer(text="Breaking Forex News Alert")
 
             try:
                 await channel.send(embed=embed, view=AlertView("USD"))
@@ -321,6 +346,12 @@ async def on_ready():
     channel = bot.get_channel(CHANNEL_ID)
     if not channel:
         logger.warning(f"Target Channel with ID '{CHANNEL_ID}' not found or bot lacks permission.")
+
+    # Start healthcheck server for Render
+    try:
+        await start_health_check_server()
+    except Exception as e:
+        logger.warning(f"Could not bind health check server: {e}")
 
     if RUN_MODE == "cron":
         logger.info("Executing single run for Cron/GitHub Actions...")
@@ -416,7 +447,7 @@ async def slash_upcoming(interaction: discord.Interaction):
             inline=False
         )
 
-    embed.set_footer(text="Forex News Bot • Pro Tip: Watch for Liquidity Grabs at key release times")
+    embed.set_footer(text="Forex News Bot • Watch for Liquidity Grabs at release times")
     await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="news", description="Fetch latest breaking Forex news headlines and sentiment")
@@ -431,7 +462,7 @@ async def slash_news(interaction: discord.Interaction):
     embed = discord.Embed(
         title="📰 Latest Forex & Macro Market Headlines",
         color=0xF1C40F,
-        description="Recent headlines from ForexLive & FXStreet with AI Sentiment:"
+        description="Recent headlines with sentiment:"
     )
 
     for entry in entries[:6]:
@@ -465,7 +496,7 @@ async def slash_status(interaction: discord.Interaction):
 # --- STARTUP ENTRY POINT ---
 if __name__ == "__main__":
     if not TOKEN:
-        logger.error("Error: DISCORD_BOT_TOKEN is missing! Please set it in your .env file or environment variables.")
+        logger.error("Error: DISCORD_BOT_TOKEN is missing!")
         exit(1)
     
     bot.run(TOKEN)
