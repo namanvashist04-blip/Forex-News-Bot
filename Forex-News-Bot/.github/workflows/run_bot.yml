@@ -1,0 +1,38 @@
+name: Forex News Bot Runner
+
+on:
+  schedule:
+    # Har 10 minute me automatically run hoga
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Bot Script (Single Run)
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          RUN_MODE: cron
+          TARGET_CURRENCIES: ${{ secrets.TARGET_CURRENCIES || 'USD,EUR,GBP,JPY,AUD,CAD,CHF,NZD' }}
+        run: |
+          python bot.py
+
+      - name: Commit and Push Database Updates
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "Update SQLite database with sent alerts [skip ci]"
+          file_pattern: "trading_bot.db"
