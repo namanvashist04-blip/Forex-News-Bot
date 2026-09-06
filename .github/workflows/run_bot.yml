@@ -2,9 +2,12 @@ name: Forex News Bot Runner
 
 on:
   schedule:
-    # Har 10 minute me automatically chalega
+    # Run every 10 minutes
     - cron: '*/10 * * * *'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-bot:
@@ -20,7 +23,11 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install -r Forex-News-Bot/requirements.txt
+          if [ -f "Forex-News-Bot/requirements.txt" ]; then
+            pip install -r Forex-News-Bot/requirements.txt
+          else
+            pip install -r requirements.txt
+          fi
 
       - name: Run Bot Script (Single Run)
         env:
@@ -29,11 +36,13 @@ jobs:
           RUN_MODE: cron
           TARGET_CURRENCIES: ${{ secrets.TARGET_CURRENCIES || 'USD,EUR,GBP,JPY,AUD,CAD,CHF,NZD' }}
         run: |
-          cd Forex-News-Bot
+          if [ -d "Forex-News-Bot" ]; then
+            cd Forex-News-Bot
+          fi
           python bot.py
 
       - name: Commit and Push Database Updates
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "Update SQLite database with sent alerts [skip ci]"
-          file_pattern: "Forex-News-Bot/trading_bot.db"
+          file_pattern: "*.db **/*.db"
