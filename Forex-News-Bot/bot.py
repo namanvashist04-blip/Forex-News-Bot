@@ -12,6 +12,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import feedparser
+import pytz
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +26,7 @@ TARGET_CURRENCIES = [c.strip().upper() for c in CURRENCIES_RAW.split(",") if c.s
 CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
 PORT = int(os.getenv("PORT", "10000"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+TIMEZONE_STR = os.getenv("TIMEZONE", "Asia/Kolkata")
 
 CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 RSS_URLS = [
@@ -51,9 +53,9 @@ logger = logging.getLogger("ForexNewsBot")
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# --- 1. SELF-HEALING HTTP HEALTHCHECK & SELF-PINGER ---
+# --- 1. HEALTHCHECK & SELF-PINGER ---
 async def start_health_check_server():
-    """Binds to PORT and self-pings to keep server alive 24/7 on Free Cloud tiers."""
+    """Binds to PORT to keep server alive 24/7 on Free Cloud tiers."""
     app = web.Application()
     async def handle_health(request):
         return web.Response(text="Forex News Bot is Healthy & Live 24/7!", content_type="text/plain")
@@ -77,7 +79,7 @@ async def self_ping_task():
     except Exception:
         pass
 
-# --- 2. RESILIENT DATABASE LAYER ---
+# --- 2. DATABASE LAYER ---
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("""
@@ -210,12 +212,11 @@ async def analyze_sentiment(headline: str) -> str:
         return "📈 **Bullish Bias Expected**"
     return "⚖️ **Neutral / High Volatility**"
 
-# --- 4. FAILOVER DATA FETCHING ---
+# --- 4. DATA FETCHING ---
 async def fetch_calendar_events():
     global cached_calendar_events, last_calendar_fetch
     now = datetime.now(timezone.utc)
     
-    # 5-minute memory cache to prevent 429 rate limits
     if cached_calendar_events and (now - last_calendar_fetch).total_seconds() < 300:
         return cached_calendar_events
 
@@ -251,7 +252,71 @@ async def fetch_breaking_news_entries():
                 logger.warning(f"Failed to fetch RSS from {url}: {e}")
     return all_entries
 
-# --- 5. AUTOMATED ALERTS MONITOR ---
+# --- 5. DAILY 00:01 MIDNIGHT BRIEFING (@everyone) ---
+async def process_daily_morning_briefing(channel: discord.TextChannel):
+    """Sends a daily summary at 00:01 (12:01 AM IST) mentioning @everyone with today's scheduled high-impact events."""
+    try:
+        tz = pytz.timezone(TIMEZONE_STR)
+    except Exception:
+        tz = pytz.timezone("Asia/Kolkata")
+
+    now_local = datetime.now(tz)
+    today_str = now_local.strftime("%Y-%m-%d")
+    digest_id = f"daily_digest_{today_str}"
+
+    # Trigger at 00:01 (Hour 0, Minute >= 1)
+    if now_local.hour == 0 and now_local.minute >= 1:
+        if await is_alert_sent(digest_id, "daily_briefing"):
+            return
+
+        events = await fetch_calendar_events()
+        matching_events = []
+        for ev in events:
+            if ev.get("impact") == "High" and ev.get("country") in TARGET_CURRENCIES:
+                try:
+                    ev_time = datetime.fromisoformat(ev.get("date", ""))
+                    ev_time_local = ev_time.astimezone(tz) if ev_time.tzinfo else ev_time.replace(tzinfo=timezone.utc).astimezone(tz)
+                    if ev_time_local.strftime("%Y-%m-%d") == today_str:
+                        matching_events.append((ev, ev_time))
+                except Exception:
+                    continue
+
+        embed = discord.Embed(
+            title=f"🌅 Daily Forex High-Impact Briefing ({now_local.strftime('%A, %d %B %Y')})",
+            color=0xF39C12,
+            description=f"Good morning traders! Aaj aane wale saare High-Impact events ki list:\n**Target Currencies:** `{', '.join(TARGET_CURRENCIES)}`"
+        )
+
+        if not matching_events:
+            embed.add_field(
+                name="✅ Clear Market Day",
+                value="Aaj target currencies ke liye koi High-Impact economic event scheduled nahi hai. Standard technical trading conditions expected.",
+                inline=False
+            )
+        else:
+            for ev, ev_time in matching_events[:12]:
+                unix_ts = int(ev_time.timestamp())
+                forecast = ev.get("forecast") or "N/A"
+                prev = ev.get("previous") or "N/A"
+                overlap = "🔥 London/NY Overlap" if check_session_overlap(ev_time) else "Standard Session"
+                volatility = get_smc_volatility(ev.get("title", ""))
+
+                embed.add_field(
+                    name=f"🔴 [{ev.get('country')}] {ev.get('title')}",
+                    value=f"⏰ **Time:** <t:{unix_ts}:t> (<t:{unix_ts}:R>)\n📊 **Forecast:** `{forecast}` | **Previous:** `{prev}`\n⚡ **Expected Move:** {volatility.split('(')[0]} | **Session:** {overlap}",
+                    inline=False
+                )
+
+        embed.set_footer(text="Forex News Bot • Daily Intelligence • Trade Safely")
+
+        try:
+            await channel.send(content="@everyone", embed=embed)
+            await mark_alert_sent(digest_id, "daily_briefing")
+            logger.info(f"Daily 00:01 Midnight Briefing sent successfully for {today_str}")
+        except Exception as e:
+            logger.error(f"Failed to send daily briefing: {e}")
+
+# --- 6. AUTOMATED EVENT & BREAKING ALERTS ---
 async def process_calendar_alerts(channel: discord.TextChannel):
     events = await fetch_calendar_events()
     if not events or not channel:
@@ -275,7 +340,6 @@ async def process_calendar_alerts(channel: discord.TextChannel):
         except Exception:
             continue
 
-        # Zero-Duplicate Time Guard: Ignore events that have already passed
         if event_time < (now - timedelta(minutes=5)):
             continue
 
@@ -355,7 +419,7 @@ async def process_breaking_news(channel: discord.TextChannel):
             except Exception as e:
                 logger.error(f"Failed to send breaking news alert: {e}")
 
-# --- 6. BACKGROUND WORKER TASK ---
+# --- 7. BACKGROUND WORKER LOOP ---
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_task():
     channel_id = await get_alert_channel_id()
@@ -364,6 +428,8 @@ async def monitor_task():
     channel = bot.get_channel(channel_id)
     if not channel:
         return
+    
+    await process_daily_morning_briefing(channel)
     await process_calendar_alerts(channel)
     await process_breaking_news(channel)
 
@@ -371,13 +437,12 @@ async def monitor_task():
 async def before_monitor_task():
     await bot.wait_until_ready()
 
-# --- 7. BOT EVENTS & AUTO RECONNECT ---
+# --- 8. BOT EVENTS & INITIALIZATION ---
 @bot.event
 async def on_ready():
     logger.info(f"Bot logged in as {bot.user} (ID: {bot.user.id})")
     await init_db()
 
-    # Sync Slash Commands
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} application slash commands.")
@@ -389,7 +454,6 @@ async def on_ready():
     if not channel:
         logger.warning(f"Target Alert Channel with ID '{channel_id}' not found. Use /setloc in Discord to set channel.")
 
-    # Start healthcheck server and self-pinger
     try:
         await start_health_check_server()
         if not self_ping_task.is_running():
@@ -400,6 +464,7 @@ async def on_ready():
     if RUN_MODE == "cron":
         logger.info("Executing single run for Cron...")
         if channel:
+            await process_daily_morning_briefing(channel)
             await process_calendar_alerts(channel)
             await process_breaking_news(channel)
         await bot.close()
@@ -408,7 +473,6 @@ async def on_ready():
             monitor_task.start()
         logger.info(f"24/7 Continuous background monitoring active ({CHECK_INTERVAL_SECONDS}s loop).")
 
-# Global Error Handler for Slash Commands so bot never silently crashes
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     logger.error(f"Command Error: {error}")
@@ -420,8 +484,8 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except Exception:
         pass
 
-# --- 8. COMMANDS ---
-@bot.tree.command(name="setloc", description="[Admin Only] Set the channel where bot sends automated alerts & crash news")
+# --- 9. COMMANDS ---
+@bot.tree.command(name="setloc", description="[Admin Only] Set the channel where bot sends daily 00:01 briefing & auto alerts")
 @app_commands.describe(channel="Select the channel for alerts (leave blank for current channel)")
 @app_commands.default_permissions(administrator=True)
 async def slash_setloc(interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -434,7 +498,7 @@ async def slash_setloc(interaction: discord.Interaction, channel: discord.TextCh
 
     embed = discord.Embed(
         title="📍 Alert Location Set Successfully!",
-        description=f"All **Automated News Warnings & Crash/Shock Alerts** will now be sent to {target_channel.mention}!\n\n*Members can use commands (`/today`, `/news`, etc.) anywhere in the server.*",
+        description=f"Ab saare **Daily 00:01 Midnight Briefing (@everyone)**, **News Warnings (24h/1h/15m)** aur **Crash Alerts** automatically {target_channel.mention} me aayenge!\n\n*Members kisi bhi channel me `/today`, `/news` commands use kar sakte hain.*",
         color=0x2ECC71
     )
     embed.set_footer(text="Forex News Bot • Alert Routing Updated")
@@ -569,7 +633,7 @@ async def slash_status(interaction: discord.Interaction):
     embed.set_footer(text="Forex News Bot System Health • Use /setloc to update alert channel")
     await interaction.response.send_message(embed=embed)
 
-# --- 9. RESILIENT ENTRY POINT WITH EXPONENTIAL BACKOFF ---
+# --- 10. RESILIENT ENTRY POINT WITH EXPONENTIAL BACKOFF ---
 if __name__ == "__main__":
     if not TOKEN:
         logger.error("Error: DISCORD_BOT_TOKEN is missing!")
@@ -585,7 +649,7 @@ if __name__ == "__main__":
             if e.status == 429:
                 logger.warning(f"Discord 429 Rate Limit encountered. Auto-cooling down for {backoff}s before reconnecting...")
                 time_module.sleep(backoff)
-                backoff = min(backoff * 2, 300) # Max 5 min backoff
+                backoff = min(backoff * 2, 300)
             else:
                 logger.error(f"Discord HTTP Exception: {e}. Retrying in 15s...")
                 time_module.sleep(15)
