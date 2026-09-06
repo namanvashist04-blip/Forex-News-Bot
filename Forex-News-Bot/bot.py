@@ -38,7 +38,7 @@ HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 }
 
-# In-Memory Cache to ensure 100% resilience against API rate limits
+# In-Memory Cache for Calendar API
 cached_calendar_events = []
 last_calendar_fetch = datetime.min.replace(tzinfo=timezone.utc)
 
@@ -49,7 +49,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ForexNewsBot")
 
-# Bot Setup with Commands & Slash tree
+# Bot Setup
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -96,12 +96,6 @@ async def init_db():
                 PRIMARY KEY (event_id, alert_type)
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS seen_news (
-                news_id TEXT PRIMARY KEY,
-                seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
         await db.commit()
 
 async def get_alert_channel_id() -> int:
@@ -145,36 +139,18 @@ async def mark_alert_sent(event_id: str, alert_type: str):
     except Exception:
         pass
 
-async def is_news_seen(news_id: str) -> bool:
-    try:
-        async with aiosqlite.connect(DB_FILE) as db:
-            async with db.execute("SELECT 1 FROM seen_news WHERE news_id = ?", (news_id,)) as cursor:
-                return (await cursor.fetchone()) is not None
-    except Exception:
-        return False
-
-async def mark_news_seen(news_id: str):
-    try:
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("INSERT OR IGNORE INTO seen_news (news_id) VALUES (?, ?)", (news_id,))
-            await db.commit()
-    except Exception:
-        pass
-
 async def get_db_stats():
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute("SELECT COUNT(*) FROM sent_alerts") as c1:
                 alerts_count = (await c1.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM seen_news") as c2:
-                news_count = (await c2.fetchone())[0]
-        return alerts_count, news_count
+        return alerts_count
     except Exception:
-        return 0, 0
+        return 0
 
 # --- 3. UI COMPONENTS & HELPERS ---
 class AlertView(discord.ui.View):
-    def __init__(self, currency: str):
+    def __init__(self, currency: str = "USD"):
         super().__init__(timeout=None)
         symbol = f"{currency}USD" if currency != "USD" else "DXY"
         self.add_item(discord.ui.Button(
@@ -230,7 +206,7 @@ async def fetch_calendar_events():
                     last_calendar_fetch = now
                     return data
                 elif response.status == 429:
-                    logger.warning("ForexFactory 429 Rate Limit: Falling back to cached data.")
+                    logger.warning("ForexFactory 429 Rate Limit: Using cached data.")
                     return cached_calendar_events
     except Exception as e:
         logger.error(f"Error fetching calendar: {e}")
@@ -264,7 +240,6 @@ async def process_daily_morning_briefing(channel: discord.TextChannel):
     today_str = now_local.strftime("%Y-%m-%d")
     digest_id = f"daily_digest_{today_str}"
 
-    # Trigger at 00:01 (Hour 0, Minute >= 1)
     if now_local.hour == 0 and now_local.minute >= 1:
         if await is_alert_sent(digest_id, "daily_briefing"):
             return
@@ -282,15 +257,15 @@ async def process_daily_morning_briefing(channel: discord.TextChannel):
                     continue
 
         embed = discord.Embed(
-            title=f"🌅 Daily Forex High-Impact Briefing ({now_local.strftime('%A, %d %B %Y')})",
-            color=0xF39C12,
-            description=f"Good morning traders! Aaj aane wale saare High-Impact events ki list:\n**Target Currencies:** `{', '.join(TARGET_CURRENCIES)}`"
+            title=f"📅 High-Impact Forex Events Today ({now_local.strftime('%A, %d %B %Y')})",
+            color=0x2ECC71,
+            description=f"Showing high-impact events for: `{', '.join(TARGET_CURRENCIES)}`"
         )
 
         if not matching_events:
             embed.add_field(
                 name="✅ Clear Market Day",
-                value="Aaj target currencies ke liye koi High-Impact economic event scheduled nahi hai. Standard technical trading conditions expected.",
+                value="Aaj target currencies ke liye koi High-Impact economic event scheduled nahi hai.",
                 inline=False
             )
         else:
@@ -299,15 +274,14 @@ async def process_daily_morning_briefing(channel: discord.TextChannel):
                 forecast = ev.get("forecast") or "N/A"
                 prev = ev.get("previous") or "N/A"
                 overlap = "🔥 London/NY Overlap" if check_session_overlap(ev_time) else "Standard Session"
-                volatility = get_smc_volatility(ev.get("title", ""))
 
                 embed.add_field(
                     name=f"🔴 [{ev.get('country')}] {ev.get('title')}",
-                    value=f"⏰ **Time:** <t:{unix_ts}:t> (<t:{unix_ts}:R>)\n📊 **Forecast:** `{forecast}` | **Previous:** `{prev}`\n⚡ **Expected Move:** {volatility.split('(')[0]} | **Session:** {overlap}",
+                    value=f"**Time:** <t:{unix_ts}:t> (<t:{unix_ts}:R>)\n**Forecast:** `{forecast}` | **Previous:** `{prev}`\n**Session:** {overlap}",
                     inline=False
                 )
 
-        embed.set_footer(text="Forex News Bot • Daily Intelligence • Trade Safely")
+        embed.set_footer(text="Forex News Bot • Daily 00:01 Briefing")
 
         try:
             await channel.send(content="@everyone", embed=embed)
@@ -316,110 +290,7 @@ async def process_daily_morning_briefing(channel: discord.TextChannel):
         except Exception as e:
             logger.error(f"Failed to send daily briefing: {e}")
 
-# --- 6. AUTOMATED EVENT & BREAKING ALERTS ---
-async def process_calendar_alerts(channel: discord.TextChannel):
-    events = await fetch_calendar_events()
-    if not events or not channel:
-        return
-
-    now = datetime.now(timezone.utc)
-
-    for event in events:
-        impact = event.get("impact", "")
-        country = event.get("country", "")
-        title = event.get("title", "")
-        raw_date = event.get("date", "")
-
-        if impact != "High" or country not in TARGET_CURRENCIES:
-            continue
-
-        try:
-            event_time = datetime.fromisoformat(raw_date)
-            if event_time.tzinfo is None:
-                event_time = event_time.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
-
-        if event_time < (now - timedelta(minutes=5)):
-            continue
-
-        time_diff = event_time - now
-        total_seconds = time_diff.total_seconds()
-        event_id = f"alert_{country}_{title}_{raw_date}"
-
-        stages = [
-            ("24h", timedelta(hours=23, minutes=45).total_seconds(), timedelta(hours=24, minutes=15).total_seconds(), 0x3498DB, "🗓️ 24-HOUR ADVANCE WARNING"),
-            ("1h", timedelta(minutes=45).total_seconds(), timedelta(minutes=70).total_seconds(), 0xE67E22, "⏰ 1-HOUR EVENT REMINDER"),
-            ("15m", timedelta(minutes=5).total_seconds(), timedelta(minutes=20).total_seconds(), 0xE74C3C, "🚨 15-MIN HIGH IMPACT IMMINENT"),
-        ]
-
-        for alert_type, min_sec, max_sec, color, stage_title in stages:
-            if min_sec <= total_seconds <= max_sec:
-                if await is_alert_sent(event_id, alert_type):
-                    continue
-
-                session_overlap = "🔥 **London / NY Overlap (High Volatility)**" if check_session_overlap(event_time) else "Standard Session"
-                volatility = get_smc_volatility(title)
-                unix_ts = int(event_time.timestamp())
-
-                embed = discord.Embed(
-                    title=f"{stage_title}: {title}",
-                    description=f"**Currency:** `{country}`\n**Time:** <t:{unix_ts}:F> (<t:{unix_ts}:R>)\n**Session:** {session_overlap}",
-                    color=color
-                )
-                embed.add_field(name="Expected Move", value=volatility, inline=False)
-                embed.add_field(name="Forecast", value=event.get("forecast") or "N/A", inline=True)
-                embed.add_field(name="Previous", value=event.get("previous") or "N/A", inline=True)
-                embed.add_field(name="Impact", value="🔴 High Impact", inline=True)
-                embed.set_footer(text="Forex News Bot • Powered by ForexFactory")
-
-                try:
-                    await channel.send(embed=embed, view=AlertView(country))
-                    await mark_alert_sent(event_id, alert_type)
-                    logger.info(f"Sent {alert_type} alert for {country} - {title}")
-                except Exception as e:
-                    logger.error(f"Failed to send calendar alert: {e}")
-
-async def process_breaking_news(channel: discord.TextChannel):
-    entries = await fetch_breaking_news_entries()
-    if not entries or not channel:
-        return
-
-    shock_keywords = [
-        "emergency", "rate cut", "rate hike", "intervention", "unplanned",
-        "flash crash", "crash", "war", "sanction", "inflation surge", "bank failure",
-        "geopolitical", "central bank", "crisis", "default", "liquidity", "plunge", "collapse"
-    ]
-
-    for entry in entries:
-        news_id = getattr(entry, "id", getattr(entry, "link", entry.title))
-        if await is_news_seen(news_id):
-            continue
-
-        title = entry.title
-        lower_title = title.lower()
-
-        if any(kw in lower_title for kw in shock_keywords):
-            sentiment = await analyze_sentiment(title)
-            summary_raw = getattr(entry, "summary", "")
-            clean_summary = clean_html_text(summary_raw)[:250]
-            
-            embed = discord.Embed(
-                title="🚨 FLASH MARKET / CRASH ALERT",
-                description=f"### [{title}]({entry.link})\n\n{clean_summary}...",
-                color=0xE74C3C
-            )
-            embed.add_field(name="Market Sentiment", value=sentiment, inline=False)
-            embed.set_footer(text="Breaking Forex Alert • Auto-detected")
-
-            try:
-                await channel.send(embed=embed, view=AlertView("USD"))
-                await mark_news_seen(news_id)
-                logger.info(f"Sent breaking news alert: {title}")
-            except Exception as e:
-                logger.error(f"Failed to send breaking news alert: {e}")
-
-# --- 7. BACKGROUND WORKER LOOP ---
+# --- 6. BACKGROUND WORKER LOOP ---
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def monitor_task():
     channel_id = await get_alert_channel_id()
@@ -429,15 +300,14 @@ async def monitor_task():
     if not channel:
         return
     
+    # Only runs the clean daily 00:01 briefing
     await process_daily_morning_briefing(channel)
-    await process_calendar_alerts(channel)
-    await process_breaking_news(channel)
 
 @monitor_task.before_loop
 async def before_monitor_task():
     await bot.wait_until_ready()
 
-# --- 8. BOT EVENTS & INITIALIZATION ---
+# --- 7. BOT EVENTS ---
 @bot.event
 async def on_ready():
     logger.info(f"Bot logged in as {bot.user} (ID: {bot.user.id})")
@@ -465,13 +335,11 @@ async def on_ready():
         logger.info("Executing single run for Cron...")
         if channel:
             await process_daily_morning_briefing(channel)
-            await process_calendar_alerts(channel)
-            await process_breaking_news(channel)
         await bot.close()
     else:
         if not monitor_task.is_running():
             monitor_task.start()
-        logger.info(f"24/7 Continuous background monitoring active ({CHECK_INTERVAL_SECONDS}s loop).")
+        logger.info(f"24/7 Monitoring active for Daily 00:01 Briefing.")
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
@@ -484,9 +352,9 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
     except Exception:
         pass
 
-# --- 9. COMMANDS ---
-@bot.tree.command(name="setloc", description="[Admin Only] Set the channel where bot sends daily 00:01 briefing & auto alerts")
-@app_commands.describe(channel="Select the channel for alerts (leave blank for current channel)")
+# --- 8. SLASH COMMANDS ---
+@bot.tree.command(name="setloc", description="[Admin Only] Set the channel where bot sends daily 00:01 briefing")
+@app_commands.describe(channel="Select the channel for daily briefing (leave blank for current channel)")
 @app_commands.default_permissions(administrator=True)
 async def slash_setloc(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not interaction.user.guild_permissions.administrator:
@@ -497,11 +365,11 @@ async def slash_setloc(interaction: discord.Interaction, channel: discord.TextCh
     await set_alert_channel_id(target_channel.id)
 
     embed = discord.Embed(
-        title="📍 Alert Location Set Successfully!",
-        description=f"Ab saare **Daily 00:01 Midnight Briefing (@everyone)**, **News Warnings (24h/1h/15m)** aur **Crash Alerts** automatically {target_channel.mention} me aayenge!\n\n*Members kisi bhi channel me `/today`, `/news` commands use kar sakte hain.*",
+        title="📍 Daily Briefing Channel Set!",
+        description=f"Ab rozana **00:01 (12:01 AM Midnight)** par **`@everyone`** mention ke sath poore din ka High-Impact News Calendar {target_channel.mention} me aayega.\n\n*Members kisi bhi channel me `/today`, `/upcoming`, `/news` commands use kar sakte hain.*",
         color=0x2ECC71
     )
-    embed.set_footer(text="Forex News Bot • Alert Routing Updated")
+    embed.set_footer(text="Forex News Bot • Configuration Updated")
     await interaction.response.send_message(embed=embed)
 
 @bot.tree.command(name="today", description="View all High-Impact Forex events scheduled for today")
@@ -616,7 +484,7 @@ async def slash_news(interaction: discord.Interaction):
 
 @bot.tree.command(name="status", description="Check Forex News Bot status, configured alert channel, and diagnostics")
 async def slash_status(interaction: discord.Interaction):
-    alerts_count, news_count = await get_db_stats()
+    alerts_count = await get_db_stats()
     latency_ms = round(bot.latency * 1000, 1)
     channel_id = await get_alert_channel_id()
     channel_display = f"<#{channel_id}>" if channel_id else "`Not Set`"
@@ -627,13 +495,13 @@ async def slash_status(interaction: discord.Interaction):
     )
     embed.add_field(name="Bot Latency", value=f"`{latency_ms} ms`", inline=True)
     embed.add_field(name="Running Mode", value=f"`{RUN_MODE.upper()}`", inline=True)
-    embed.add_field(name="Alert Channel (Auto-Posts)", value=channel_display, inline=True)
+    embed.add_field(name="Daily Briefing Channel", value=channel_display, inline=True)
     embed.add_field(name="Monitored Currencies", value=f"`{', '.join(TARGET_CURRENCIES)}`", inline=False)
-    embed.add_field(name="Database Records", value=f"• Sent Alerts: `{alerts_count}`\n• Seen News: `{news_count}`", inline=False)
-    embed.set_footer(text="Forex News Bot System Health • Use /setloc to update alert channel")
+    embed.add_field(name="Daily Briefings Sent", value=f"`{alerts_count}`", inline=False)
+    embed.set_footer(text="Forex News Bot System Health • Use /setloc to update channel")
     await interaction.response.send_message(embed=embed)
 
-# --- 10. RESILIENT ENTRY POINT WITH EXPONENTIAL BACKOFF ---
+# --- 9. RESILIENT ENTRY POINT ---
 if __name__ == "__main__":
     if not TOKEN:
         logger.error("Error: DISCORD_BOT_TOKEN is missing!")
@@ -647,12 +515,12 @@ if __name__ == "__main__":
             break
         except discord.errors.HTTPException as e:
             if e.status == 429:
-                logger.warning(f"Discord 429 Rate Limit encountered. Auto-cooling down for {backoff}s before reconnecting...")
+                logger.warning(f"Discord 429 Rate Limit. Reconnecting in {backoff}s...")
                 time_module.sleep(backoff)
                 backoff = min(backoff * 2, 300)
             else:
                 logger.error(f"Discord HTTP Exception: {e}. Retrying in 15s...")
                 time_module.sleep(15)
         except Exception as e:
-            logger.error(f"Unexpected connection drop: {e}. Reconnecting in 15s...")
+            logger.error(f"Unexpected drop: {e}. Reconnecting in 15s...")
             time_module.sleep(15)
